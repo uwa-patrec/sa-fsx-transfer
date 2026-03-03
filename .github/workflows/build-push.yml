@@ -29,9 +29,9 @@ jobs:
       - name: Set ECR repository name dynamically
         run: |
           if [[ "${GITHUB_REF##*/}" == "main" ]]; then
-            echo "ECR_REPOSITORY_NAME=dev-s3-downloader" >> $GITHUB_ENV
+            echo "ECR_REPOSITORY_NAME=dev-ecr-downloader" >> $GITHUB_ENV
           else
-            echo "ECR_REPOSITORY_NAME=sense-analytics-${GITHUB_REF##*/}-s3-downloader" >> $GITHUB_ENV
+            echo "ECR_REPOSITORY_NAME=sense-analytics-${GITHUB_REF##*/}-env-downloader" >> $GITHUB_ENV
           fi
 
       - name: Checkout code
