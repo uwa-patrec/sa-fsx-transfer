@@ -50,13 +50,15 @@ def download_from_s3():
     # Create directory if needed
     fsx_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Configure optimized transfer (parallel downloads)
-    # This can speed up downloads from 60s to ~30s for large files
+    # Configure optimized transfer for large video files (typically 500 MB - 2 GB+).
+    # Previous config used 1024 * 25 = 25 KB chunks (unit bug: comment said 25 MB),
+    # which produced ~25,600 range-GETs for a 640 MB file and capped throughput
+    # at ~8 MB/s due to per-request overhead dominating bandwidth.
     transfer_config = TransferConfig(
-        multipart_threshold=1024 * 25,      # 25 MB - start multipart for files > 25MB
-        max_concurrency=10,                  # 10 parallel threads
-        multipart_chunksize=1024 * 25,      # 25 MB per chunk
-        use_threads=True                     # Enable threading
+        multipart_threshold=64 * 1024 * 1024,   # 64 MB — use multipart for files > 64 MB
+        max_concurrency=20,                      # 20 parallel threads
+        multipart_chunksize=64 * 1024 * 1024,   # 64 MB per part
+        use_threads=True,                        # Enable threading
     )
 
     # Initialize S3 client
