@@ -54,10 +54,16 @@ def download_from_s3():
     # Previous config used 1024 * 25 = 25 KB chunks (unit bug: comment said 25 MB),
     # which produced ~25,600 range-GETs for a 640 MB file and capped throughput
     # at ~8 MB/s due to per-request overhead dominating bandwidth.
+    #
+    # Memory note: boto3 keeps up to max_concurrency parts in flight, each up to
+    # multipart_chunksize, so peak resident memory ~= max_concurrency * chunksize.
+    # 20 * 64 MB = 1.28 GB overflowed the 2 GB job container and raised
+    # "[Errno 12] Cannot allocate memory" on a 3.5 GB file. 8 * 16 MB = 128 MB
+    # stays well within 2 GB while keeping enough parallelism for throughput.
     transfer_config = TransferConfig(
         multipart_threshold=64 * 1024 * 1024,   # 64 MB — use multipart for files > 64 MB
-        max_concurrency=20,                      # 20 parallel threads
-        multipart_chunksize=64 * 1024 * 1024,   # 64 MB per part
+        max_concurrency=8,                       # 8 parallel threads (was 20 — bounded memory)
+        multipart_chunksize=16 * 1024 * 1024,   # 16 MB per part (was 64 MB)
         use_threads=True,                        # Enable threading
     )
 
