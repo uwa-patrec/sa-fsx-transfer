@@ -1,0 +1,6 @@
+# Dev/test-only dependencies (not installed into the container image).
+# Run tests with:  python -m venv .venv && . .venv/bin/activate
+#                  pip install -r requirements-dev.txt && pytest
+boto3
+moto[s3]
+pytest

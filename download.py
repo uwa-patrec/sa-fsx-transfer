@@ -2,8 +2,9 @@
 """
 Stage 0: S3 to FSx Downloader
 
-This script downloads a file from S3 to FSx using optimized multipart download.
-It's designed to run on cheap CPU instances before GPU processing begins.
+This script downloads a file from S3 to FSx using a memory-bounded, parallel
+ranged download. It's designed to run on cheap CPU instances before GPU
+processing begins.
 
 Environment Variables:
     S3_BUCKET: Source S3 bucket name
@@ -16,7 +17,28 @@ import sys
 import boto3
 from pathlib import Path
 from datetime import datetime
-from boto3.s3.transfer import TransferConfig
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# Download tuning.
+#
+# Memory note: the previous implementation used boto3 download_file, which writes
+# to the destination with default buffered I/O. Writing a multi-GB video to the
+# FSx Lustre mount accumulates dirty page-cache pages that are charged to the
+# container's memory cgroup. On a 3.5 GB file in a 2 GB container this overflowed
+# the cgroup ("[Errno 12] Cannot allocate memory", exit 1) — independent of
+# boto3's part buffers. Past a few GB no container size is large enough, because
+# dirty pages grow while ingest outpaces FSx writeback.
+#
+# This implementation keeps memory bounded regardless of file size: it downloads
+# fixed-size ranges in parallel (to saturate FSx throughput) and, as parts land,
+# periodically flushes written data to FSx and drops it from the page cache via
+# posix_fadvise(DONTNEED). Peak resident pages stay ~= a couple of EVICT_BYTES.
+DEFAULT_PART_SIZE = 32 * 1024 * 1024     # 32 MB per ranged GET
+DEFAULT_MAX_WORKERS = 8                   # parallel S3 connections
+DEFAULT_READ_SIZE = 8 * 1024 * 1024      # 8 MB socket read granularity
+DEFAULT_EVICT_BYTES = 256 * 1024 * 1024  # flush + drop page cache every ~256 MB
+_PART_RETRIES = 3
 
 
 def format_bytes(bytes_val):
@@ -26,6 +48,96 @@ def format_bytes(bytes_val):
             return f"{bytes_val:.2f} {unit}"
         bytes_val /= 1024.0
     return f"{bytes_val:.2f} PB"
+
+
+def _drop_cache(fd):
+    """Flush dirty pages to FSx and evict the whole file from the page cache.
+
+    posix_fadvise(DONTNEED) only drops clean pages, so fdatasync first to turn
+    written (dirty) pages into clean ones. Both are Linux-only; on platforms
+    without them (e.g. macOS dev machines) this is a no-op and the download still
+    produces a correct file — it just won't bound the page cache there.
+    """
+    try:
+        os.fdatasync(fd)
+    except (OSError, AttributeError):
+        pass
+    if hasattr(os, "posix_fadvise"):
+        try:
+            # offset 0, length 0 => to end of file
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+
+
+def _download_part(s3_client, bucket, key, fd, start, end):
+    """Download bytes [start, end] (inclusive) and pwrite them at their offset."""
+    last_err = None
+    for _ in range(_PART_RETRIES):
+        try:
+            resp = s3_client.get_object(
+                Bucket=bucket, Key=key, Range=f"bytes={start}-{end}"
+            )
+            body = resp["Body"]
+            offset = start
+            while True:
+                data = body.read(DEFAULT_READ_SIZE)
+                if not data:
+                    break
+                os.pwrite(fd, data, offset)
+                offset += len(data)
+            return end - start + 1
+        except Exception as e:  # noqa: BLE001 — retry any transient S3/socket error
+            last_err = e
+    raise last_err
+
+
+def download_object(
+    s3_client,
+    bucket,
+    key,
+    dest_path,
+    file_size,
+    *,
+    part_size=DEFAULT_PART_SIZE,
+    max_workers=DEFAULT_MAX_WORKERS,
+    evict_bytes=DEFAULT_EVICT_BYTES,
+):
+    """Download an S3 object to dest_path with bounded memory usage.
+
+    Ranges are fetched in parallel and written directly to the destination fd;
+    the page cache is periodically flushed and dropped so dirty pages cannot
+    accumulate against the container's memory cgroup.
+    """
+    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+
+    fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        if file_size == 0:
+            return
+
+        os.ftruncate(fd, file_size)
+
+        parts = [
+            (start, min(start + part_size, file_size) - 1)
+            for start in range(0, file_size, part_size)
+        ]
+
+        done_bytes = 0
+        last_evict = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_download_part, s3_client, bucket, key, fd, s, e): (s, e)
+                for s, e in parts
+            }
+            for fut in as_completed(futures):
+                done_bytes += fut.result()  # propagate part failures
+                if done_bytes - last_evict >= evict_bytes:
+                    _drop_cache(fd)
+                    last_evict = done_bytes
+    finally:
+        _drop_cache(fd)
+        os.close(fd)
 
 
 def download_from_s3():
@@ -50,23 +162,6 @@ def download_from_s3():
     # Create directory if needed
     fsx_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Configure optimized transfer for large video files (typically 500 MB - 2 GB+).
-    # Previous config used 1024 * 25 = 25 KB chunks (unit bug: comment said 25 MB),
-    # which produced ~25,600 range-GETs for a 640 MB file and capped throughput
-    # at ~8 MB/s due to per-request overhead dominating bandwidth.
-    #
-    # Memory note: boto3 keeps up to max_concurrency parts in flight, each up to
-    # multipart_chunksize, so peak resident memory ~= max_concurrency * chunksize.
-    # 20 * 64 MB = 1.28 GB overflowed the 2 GB job container and raised
-    # "[Errno 12] Cannot allocate memory" on a 3.5 GB file. 8 * 16 MB = 128 MB
-    # stays well within 2 GB while keeping enough parallelism for throughput.
-    transfer_config = TransferConfig(
-        multipart_threshold=64 * 1024 * 1024,   # 64 MB — use multipart for files > 64 MB
-        max_concurrency=8,                       # 8 parallel threads (was 20 — bounded memory)
-        multipart_chunksize=16 * 1024 * 1024,   # 16 MB per part (was 64 MB)
-        use_threads=True,                        # Enable threading
-    )
-
     # Initialize S3 client
     s3_client = boto3.client('s3')
 
@@ -88,16 +183,11 @@ def download_from_s3():
     print(f"Started:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
-    # Download file with progress tracking
+    # Download file (memory-bounded, parallel ranged GETs)
     start_time = datetime.now()
 
     try:
-        s3_client.download_file(
-            Bucket=s3_bucket,
-            Key=s3_key,
-            Filename=str(fsx_file),
-            Config=transfer_config
-        )
+        download_object(s3_client, s3_bucket, s3_key, str(fsx_file), file_size)
     except Exception as e:
         print(f"\nERROR: Download failed: {e}", file=sys.stderr)
         sys.exit(1)
