@@ -210,6 +210,31 @@ def stage_via_dra(
     return dest
 
 
+def ensure_shared_object(s3_client, bucket, key, dest_path):
+    """Idempotently copy a shared artifact (e.g. the detection TensorRT engine)
+    from S3 to a fixed FSx path.
+
+    The detection stage expects /fsx/shared/engine/<engine> to already exist on
+    the shared filesystem; an FSx replacement wipes it. Stage 0 runs first, so
+    it ensures the artifact is present: copy only when missing or the wrong
+    size, otherwise skip. Downloads to a temp file + atomic rename so a
+    concurrent reader never sees a partial file. Returns True if copied.
+    """
+    try:
+        expected = s3_client.head_object(Bucket=bucket, Key=key)["ContentLength"]
+    except Exception as e:
+        raise RuntimeError(f"shared object s3://{bucket}/{key} unavailable: {e}")
+
+    if os.path.exists(dest_path) and os.path.getsize(dest_path) == expected:
+        return False
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    tmp = f"{dest_path}.tmp.{os.getpid()}"
+    download_object(s3_client, bucket, key, tmp, expected)
+    os.replace(tmp, dest_path)  # atomic on the same filesystem
+    return True
+
+
 def download_from_s3():
     """Download file from S3 to FSx with optimized transfer"""
 
@@ -307,6 +332,23 @@ def download_from_s3():
         sys.exit(1)
 
     print("\nFile verified successfully. Ready for GPU processing.")
+
+    # Ensure shared prerequisites exist on FSx (e.g. the detection TensorRT
+    # engine). Stage 0 runs first, so this guarantees the artifact is present
+    # before detection — important after an FSx replacement wipes /fsx/shared.
+    # Idempotent: copies only when missing/wrong-size. Opt-in via MODEL_S3_KEY.
+    model_key = os.environ.get("MODEL_S3_KEY")
+    if model_key:
+        model_dest = os.environ.get(
+            "MODEL_DEST_PATH", f"/fsx/shared/engine/{Path(model_key).name}"
+        )
+        try:
+            copied = ensure_shared_object(s3_client, s3_bucket, model_key, model_dest)
+            print(f"Shared model: {'copied to' if copied else 'already present at'} {model_dest}")
+        except Exception as e:
+            print(f"\nERROR: failed to ensure shared model {model_key}: {e}", file=sys.stderr)
+            sys.exit(1)
+
     return 0
 
 
