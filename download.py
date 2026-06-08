@@ -14,6 +14,7 @@ Environment Variables:
 
 import os
 import sys
+import time
 import boto3
 from pathlib import Path
 from datetime import datetime
@@ -140,6 +141,75 @@ def download_object(
         os.close(fd)
 
 
+# ------------------------------------------------------------------------------
+# DRA staging mode
+#
+# When FSx has a Data Repository Association, the input video is lazy-loaded from
+# S3 by FSx itself and appears under the import path (DRA_MOUNT) mirroring the S3
+# key. We don't copy any bytes through this container — we just symlink the
+# imported file into the run-scoped dir the rest of the pipeline expects, so the
+# OOM-prone in-cgroup copy is gone entirely. The data is fetched server-side by
+# FSx when preprocessing first reads it.
+# ------------------------------------------------------------------------------
+DEFAULT_DRA_MOUNT = "/fsx/s3input"
+DEFAULT_S3_IMPORT_PREFIX = "input/"
+DEFAULT_DRA_WAIT_SECONDS = 300   # tolerate auto-import latency (best-effort, not instant)
+DEFAULT_DRA_POLL_SECONDS = 3
+
+
+def dra_source_path(s3_key, dra_mount, import_prefix):
+    """Map an S3 key to its file path under the DRA import mount.
+
+    The DRA mirrors s3://bucket/<import_prefix> -> <dra_mount>, so the key with
+    the prefix stripped, joined onto the mount, is where FSx exposes the object.
+    """
+    rel = s3_key[len(import_prefix):] if s3_key.startswith(import_prefix) else s3_key
+    return os.path.join(dra_mount, rel)
+
+
+def stage_via_dra(
+    s3_key,
+    output_path,
+    *,
+    dra_mount,
+    import_prefix,
+    expected_size,
+    wait_seconds=DEFAULT_DRA_WAIT_SECONDS,
+    poll_seconds=DEFAULT_DRA_POLL_SECONDS,
+):
+    """Symlink the DRA-imported object into output_path; return the link path.
+
+    Waits up to wait_seconds for FSx auto-import to make the object visible at
+    the expected size (import is best-effort, not instant). Raises TimeoutError
+    if it never appears — failing on this cheap CPU stage rather than letting a
+    downstream GPU stage hit a missing/partial file.
+    """
+    src = dra_source_path(s3_key, dra_mount, import_prefix)
+    os.makedirs(output_path, exist_ok=True)
+    dest = os.path.join(output_path, os.path.basename(s3_key))
+
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            if os.path.getsize(src) == expected_size:
+                break
+        except OSError:
+            pass  # not visible yet
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"DRA source not available at expected size after {wait_seconds}s: "
+                f"{src} (expected {expected_size} bytes). Is auto-import enabled "
+                f"and has the S3 object been uploaded?"
+            )
+        time.sleep(poll_seconds)
+
+    # Replace any stale link/file from a prior attempt, then link.
+    if os.path.islink(dest) or os.path.exists(dest):
+        os.remove(dest)
+    os.symlink(src, dest)
+    return dest
+
+
 def download_from_s3():
     """Download file from S3 to FSx with optimized transfer"""
 
@@ -147,6 +217,12 @@ def download_from_s3():
     s3_bucket = os.environ.get('S3_BUCKET')
     s3_key = os.environ.get('S3_KEY')
     output_path = os.environ.get('OUTPUT_PATH', '/fsx/input')
+
+    # Mode: "dra" stages the FSx-imported file via symlink (no copy); "copy"
+    # falls back to the in-container memory-bounded download (rollback path).
+    mode = os.environ.get('DOWNLOAD_MODE', 'dra').lower()
+    dra_mount = os.environ.get('DRA_MOUNT', DEFAULT_DRA_MOUNT)
+    import_prefix = os.environ.get('S3_IMPORT_PREFIX', DEFAULT_S3_IMPORT_PREFIX)
 
     # Validate required parameters
     if not s3_bucket or not s3_key:
@@ -165,7 +241,7 @@ def download_from_s3():
     # Initialize S3 client
     s3_client = boto3.client('s3')
 
-    # Get file size
+    # Get file size (used to verify the copy / confirm DRA import is complete)
     try:
         response = s3_client.head_object(Bucket=s3_bucket, Key=s3_key)
         file_size = response['ContentLength']
@@ -175,7 +251,7 @@ def download_from_s3():
 
     # Print download info
     print("=" * 70)
-    print("Stage 0: S3 to FSx Download")
+    print(f"Stage 0: S3 to FSx ({'DRA symlink' if mode == 'dra' else 'copy'})")
     print("=" * 70)
     print(f"Source:      s3://{s3_bucket}/{s3_key}")
     print(f"Destination: {fsx_file}")
@@ -183,13 +259,20 @@ def download_from_s3():
     print(f"Started:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
-    # Download file (memory-bounded, parallel ranged GETs)
     start_time = datetime.now()
 
     try:
-        download_object(s3_client, s3_bucket, s3_key, str(fsx_file), file_size)
+        if mode == 'dra':
+            staged = stage_via_dra(
+                s3_key, output_path,
+                dra_mount=dra_mount, import_prefix=import_prefix,
+                expected_size=file_size,
+            )
+            print(f"Linked:      {staged} -> {os.path.realpath(staged)}")
+        else:
+            download_object(s3_client, s3_bucket, s3_key, str(fsx_file), file_size)
     except Exception as e:
-        print(f"\nERROR: Download failed: {e}", file=sys.stderr)
+        print(f"\nERROR: {'Staging' if mode == 'dra' else 'Download'} failed: {e}", file=sys.stderr)
         sys.exit(1)
 
     end_time = datetime.now()
